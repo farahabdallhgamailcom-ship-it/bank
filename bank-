@@ -1,0 +1,446 @@
+<?php
+// اتصال بقاعدة البيانات
+$host = "localhost";
+$db = "bank";
+$user = "root";
+$pass = "";
+
+session_start();
+
+try {
+    $pdo = new PDO("mysql:host=$host;dbname=$db;charset=utf8mb4", $user, $pass);
+    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+} catch (PDOException $e) {
+    die("فشل الاتصال بقاعدة البيانات: " . $e->getMessage());
+}
+
+$message = "";
+$message_color = "red"; // اللون الافتراضي للرسائل (خطأ)
+
+// حقول لإعادة العرض في الفورم
+$entered_source = "";
+$entered_target = "";
+$entered_amount = "";
+
+// إعداد خيار إخفاء البيانات في العرض (يتم تخزينه بالجلسة)
+if (isset($_GET['toggle_hide'])) {
+    $_SESSION['hide_accounts_data'] = empty($_SESSION['hide_accounts_data']) ? 1 : 0;
+    header("Location: " . strtok($_SERVER["REQUEST_URI"], '?'));
+    exit;
+}
+$hide_accounts_data = !empty($_SESSION['hide_accounts_data']);
+
+// === إدارة الحسابات: تعديل وحذف ===
+// عرض نموذج تعديل حساب (GET edit_account)
+$editing_account = false;
+$account_edit = null;
+if (isset($_GET['edit_account']) && ctype_digit($_GET['edit_account'])) {
+    $accId = (int)$_GET['edit_account'];
+    $stmt = $pdo->prepare("SELECT * FROM account WHERE id = ?");
+    $stmt->execute([$accId]);
+    $account_edit = $stmt->fetch(PDO::FETCH_ASSOC);
+    if ($account_edit) {
+        $editing_account = true;
+    }
+}
+
+// حفظ تعديل الحساب (POST save_account)
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_account']) && isset($_POST['account_id']) && ctype_digit($_POST['account_id'])) {
+    $accId = (int)$_POST['account_id'];
+    $name_in = trim($_POST['account_name'] ?? '');
+    $balance_raw = trim($_POST['account_balance'] ?? '');
+    $balance_raw = str_replace(',', '.', $balance_raw);
+
+    if ($name_in === '') {
+        $message = "الرجاء إدخال اسم الحساب.";
+    } elseif ($balance_raw === '' || !is_numeric($balance_raw)) {
+        $message = "الرجاء إدخال رصيد صالح.";
+    } else {
+        $balance = (float)$balance_raw;
+        if ($balance < 0) {
+            $message = "لا يمكن أن يكون الرصيد سالبًا.";
+        } else {
+            try {
+                $stmt = $pdo->prepare("UPDATE account SET name = ?, balance = ? WHERE id = ?");
+                $stmt->execute([$name_in, $balance, $accId]);
+                $message = "تم تحديث بيانات الحساب.";
+                $message_color = "green";
+                // تحديث المتغيّرات العرضية إن كنا نحرّر نفس الحساب
+                $editing_account = false;
+                $account_edit = null;
+            } catch (Exception $e) {
+                $message = "فشل تحديث الحساب: " . $e->getMessage();
+            }
+        }
+    }
+}
+
+// حذف حساب (GET delete_account)
+if (isset($_GET['delete_account']) && ctype_digit($_GET['delete_account'])) {
+    $accId = (int)$_GET['delete_account'];
+    try {
+        // نتحقق أولاً هل هناك معاملات تربط بهذا الحساب
+        $stmt = $pdo->prepare("SELECT COUNT(*) FROM transaction WHERE source_account = ? OR target_account = ?");
+        $stmt->execute([$accId, $accId]);
+        $count = (int)$stmt->fetchColumn();
+        if ($count > 0) {
+            $message = "لا يمكن حذف الحساب لأنه مرتبط بمعاملات. احذف المعاملات أولاً أو حررها.";
+        } else {
+            $stmt = $pdo->prepare("DELETE FROM account WHERE id = ?");
+            $stmt->execute([$accId]);
+            $message = "تم حذف الحساب بنجاح.";
+            $message_color = "green";
+        }
+    } catch (Exception $e) {
+        $message = "فشل حذف الحساب: " . $e->getMessage();
+    }
+}
+
+// --- إجراء حذف جميع الحسابات (وأيضاً سجلات المعاملات) إذا طلب المستخدم ---
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['clear_accounts'])) {
+    try {
+        $pdo->beginTransaction();
+        $pdo->exec("DELETE FROM transaction");
+        $pdo->exec("DELETE FROM account");
+        $pdo->commit();
+        $message = "تم حذف كل الحسابات وسجل التحويلات بنجاح.";
+        $message_color = "green";
+    } catch (Exception $e) {
+        $pdo->rollBack();
+        $message = "فشل حذف الحسابات: " . $e->getMessage();
+    }
+}
+
+// دالة لعكس (إرجاع) تأثير معاملة على الأرصدة
+function reverseTransaction(PDO $pdo, array $tx): void {
+    $src = isset($tx['source_account']) ? (int)$tx['source_account'] : null;
+    $tgt = isset($tx['target_account']) ? (int)$tx['target_account'] : null;
+    $amount = (float)$tx['amount'];
+
+    if ($tgt) {
+        $stmt = $pdo->prepare("UPDATE account SET balance = balance - ? WHERE id = ?");
+        $stmt->execute([$amount, $tgt]);
+    }
+    if ($src) {
+        $stmt = $pdo->prepare("UPDATE account SET balance = balance + ? WHERE id = ?");
+        $stmt->execute([$amount, $src]);
+    }
+}
+
+// معالجة حذف معاملة فردية
+if (isset($_GET['delete']) && ctype_digit($_GET['delete'])) {
+    $txId = (int)$_GET['delete'];
+    try {
+        $pdo->beginTransaction();
+        $stmt = $pdo->prepare("SELECT * FROM transaction WHERE id = ?");
+        $stmt->execute([$txId]);
+        $tx = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        if ($tx) {
+            reverseTransaction($pdo, $tx);
+            $stmt = $pdo->prepare("DELETE FROM transaction WHERE id = ?");
+            $stmt->execute([$txId]);
+            $pdo->commit();
+            $message = "تم حذف المعاملة وعكس تأثيرها على الأرصدة (إن وجدت).";
+            $message_color = "green";
+        } else {
+            $pdo->rollBack();
+            $message = "المعاملة المطلوبة غير موجودة.";
+        }
+    } catch (Exception $e) {
+        $pdo->rollBack();
+        $message = "فشل حذف المعاملة: " . $e->getMessage();
+    }
+}
+
+// معالجة عرض نموذج التعديل: جلب بيانات المعاملة لملء الحقول
+$editing = false;
+$edit_tx = null;
+if (isset($_GET['edit']) && ctype_digit($_GET['edit'])) {
+    $editId = (int)$_GET['edit'];
+    $stmt = $pdo->prepare("SELECT * FROM transaction WHERE id = ?");
+    $stmt->execute([$editId]);
+    $edit_tx = $stmt->fetch(PDO::FETCH_ASSOC);
+    if ($edit_tx) {
+        $editing = true;
+        $entered_source = (string)$edit_tx['source_account'];
+        $entered_target = (string)$edit_tx['target_account'];
+        $entered_amount = (string)$edit_tx['amount'];
+    }
+}
+
+// معالجة حفظ تعديل المعاملة
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_edit']) && isset($_POST['edit_id']) && ctype_digit($_POST['edit_id'])) {
+    $editId = (int)$_POST['edit_id'];
+    $src_in = trim($_POST['source_account'] ?? '');
+    $tgt_in = trim($_POST['target_account'] ?? '');
+    $raw_amount = trim($_POST['amount'] ?? '');
+
+    $entered_source = $src_in;
+    $entered_target = $tgt_in;
+    $entered_amount = $raw_amount;
+
+    $raw_amount = str_replace(',', '.', $raw_amount);
+
+    if ($src_in === '' || $tgt_in === '' || $raw_amount === '') {
+        $message = "الرجاء تعبئة جميع الحقول عند التعديل.";
+    } elseif (!is_numeric($raw_amount)) {
+        $message = "المبلغ غير صالح.";
+    } else {
+        $new_amount = (float)$raw_amount;
+        if ($new_amount <= 0) {
+            $message = "يجب أن يكون المبلغ موجبًا.";
+        } else {
+            try {
+                $pdo->beginTransaction();
+                $stmt = $pdo->prepare("SELECT * FROM transaction WHERE id = ?");
+                $stmt->execute([$editId]);
+                $old = $stmt->fetch(PDO::FETCH_ASSOC);
+
+                if (!$old) {
+                    $pdo->rollBack();
+                    $message = "المعاملة المراد تعديلها غير موجودة.";
+                } else {
+                    reverseTransaction($pdo, $old);
+
+                    $new_src = ctype_digit($src_in) ? (int)$src_in : 0;
+                    $new_tgt = ctype_digit($tgt_in) ? (int)$tgt_in : 0;
+
+                    if ($new_src) {
+                        $stmt = $pdo->prepare("UPDATE account SET balance = balance - ? WHERE id = ?");
+                        $stmt->execute([$new_amount, $new_src]);
+                    }
+                    if ($new_tgt) {
+                        $stmt = $pdo->prepare("UPDATE account SET balance = balance + ? WHERE id = ?");
+                        $stmt->execute([$new_amount, $new_tgt]);
+                    }
+
+                    $stmt = $pdo->prepare("UPDATE transaction SET source_account = ?, target_account = ?, amount = ?, transaction_date = NOW() WHERE id = ?");
+                    $stmt->execute([ (ctype_digit($src_in) ? (int)$src_in : 0), (ctype_digit($tgt_in) ? (int)$tgt_in : 0), $new_amount, $editId ]);
+
+                    $pdo->commit();
+                    $message = "تم تعديل المعاملة وتحديث الأرصدة (إن وجدت).";
+                    $message_color = "green";
+
+                    $editing = false;
+                    $edit_tx = null;
+                    $entered_source = "";
+                    $entered_target = "";
+                    $entered_amount = "";
+                }
+            } catch (Exception $e) {
+                $pdo->rollBack();
+                $message = "فشل تعديل المعاملة: " . $e->getMessage();
+            }
+        }
+    }
+}
+
+// معالجة إنشاء تحويل جديد (إدخال مباشر للحساب المرسل والمستهدف)
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['transfer']) && !isset($_POST['save_edit']) && !isset($_POST['clear_accounts']) && !isset($_POST['save_account'])) {
+    $src_in = trim($_POST['source_account'] ?? '');
+    $tgt_in = trim($_POST['target_account'] ?? '');
+    $raw_amount = trim($_POST['amount'] ?? '');
+
+    $entered_source = $src_in;
+    $entered_target = $tgt_in;
+    $entered_amount = $raw_amount;
+
+    $raw_amount = str_replace(',', '.', $raw_amount);
+
+    if ($src_in === '' || $tgt_in === '' || $raw_amount === '') {
+        $message = "الرجاء تعبئة جميع الحقول.";
+    } elseif (!is_numeric($raw_amount)) {
+        $message = "المبلغ غير صالح.";
+    } else {
+        $amount = (float)$raw_amount;
+        if ($amount <= 0) {
+            $message = "المبلغ يجب أن يكون موجبًا.";
+        } else {
+            try {
+                $pdo->beginTransaction();
+
+                $src_id = ctype_digit($src_in) ? (int)$src_in : 0;
+                $tgt_id = ctype_digit($tgt_in) ? (int)$tgt_in : 0;
+
+                if ($src_id) {
+                    $stmt = $pdo->prepare("UPDATE account SET balance = balance - ? WHERE id = ?");
+                    $stmt->execute([$amount, $src_id]);
+                }
+                if ($tgt_id) {
+                    $stmt = $pdo->prepare("UPDATE account SET balance = balance + ? WHERE id = ?");
+                    $stmt->execute([$amount, $tgt_id]);
+                }
+
+                $stmt = $pdo->prepare("INSERT INTO transaction (source_account, target_account, amount, transaction_date) VALUES (?, ?, ?, NOW())");
+                $stmt->execute([ $src_id, $tgt_id, $amount ]);
+
+                $pdo->commit();
+
+                $message = "تم تسجيل التحويل بنجاح (تم تحديث الأرصدة إذا كانت الحسابات موجودة ID).";
+                $message_color = "green";
+
+                $entered_source = "";
+                $entered_target = "";
+                $entered_amount = "";
+            } catch (Exception $e) {
+                $pdo->rollBack();
+                $message = "فشل تسجيل التحويل: " . $e->getMessage();
+            }
+        }
+    }
+}
+
+// جلب الحسابات والسجلات للعرض
+$accounts = $pdo->query("SELECT * FROM account ORDER BY id ASC")->fetchAll(PDO::FETCH_ASSOC);
+$transactions = $pdo->query("
+    SELECT t.id, t.source_account, t.target_account, t.amount, t.transaction_date,
+           a1.name AS source_name, a2.name AS target_name
+    FROM transaction t
+    LEFT JOIN account a1 ON t.source_account = a1.id
+    LEFT JOIN account a2 ON t.target_account = a2.id
+    ORDER BY t.transaction_date DESC
+")->fetchAll(PDO::FETCH_ASSOC);
+?>
+<!DOCTYPE html>
+<html lang="ar">
+<head>
+    <meta charset="utf-8">
+    <title>نظام تحويل الأموال - تعديل الحسابات</title>
+    <style>
+        body { font-family: Arial, sans-serif; direction: rtl; background:#f0f2f5; margin:0; padding:20px; }
+        .container { max-width:1100px; margin:0 auto; background:#fff; padding:20px; border-radius:10px; box-shadow:0 4px 12px rgba(0,0,0,0.08); }
+        h2 { text-align:center; color:#333; }
+        .controls { display:flex; gap:8px; justify-content:flex-start; align-items:center; margin-bottom:12px; flex-wrap:wrap; }
+        form.inline { display:flex; gap:8px; align-items:center; }
+        input[type="text"], input[type="number"] { padding:8px 10px; border-radius:6px; border:1px solid #ccc; font-size:15px; }
+        .btn { background:#28a745; color:#fff; border:none; padding:8px 12px; border-radius:6px; cursor:pointer; text-decoration:none; display:inline-block; }
+        .btn.secondary { background:#007bff; }
+        .btn.danger { background:#dc3545; }
+        table { width:100%; border-collapse:collapse; margin-top:16px; }
+        th, td { border:1px solid #e0e0e0; padding:10px; text-align:center; }
+        th { background:#007bff; color:#fff; }
+        .message { font-weight:bold; padding:8px; margin-bottom:12px; text-align:center; }
+        .small { font-size:13px; color:#666; }
+        .actions a { margin:0 6px; text-decoration:none; color:#fff; padding:6px 8px; border-radius:4px; }
+        .actions .edit { background:#007bff; }
+        .actions .delete { background:#dc3545; }
+        .account-actions a { margin:0 4px; display:inline-block; padding:6px 8px; color:#fff; border-radius:4px; text-decoration:none; }
+        .account-actions .edit { background:#17a2b8; }
+        .account-actions .delete { background:#dc3545; }
+    </style>
+    <script>
+        function confirmClear() {
+            return confirm('هل أنت متأكد من حذف كل الحسابات وسجل التحويلات؟ هذه العملية لا يمكن التراجع عنها.');
+        }
+        function confirmDeleteAccount() {
+            return confirm('هل أنت متأكد من حذف هذا الحساب؟ إن وجود معاملات مرتبطة يمنع الحذف.');
+        }
+    </script>
+</head>
+<body>
+<div class="container">
+    <h2>نظام تحويل الأموال</h2>
+
+    <?php if ($message): ?>
+        <div class="message" style="color:<?= htmlspecialchars($message_color, ENT_QUOTES, 'UTF-8') ?>;">
+            <?= htmlspecialchars($message, ENT_QUOTES, 'UTF-8') ?>
+        </div>
+    <?php endif; ?>
+
+    <div class="controls">
+        <a href="?toggle_hide=1" class="btn secondary"><?= $hide_accounts_data ? 'إظهار بيانات الحسابات' : 'إخفاء بيانات الحسابات' ?></a>
+
+        <form method="post" class="inline" onsubmit="return confirmClear();">
+            <input type="hidden" name="clear_accounts" value="1">
+            <button type="submit" class="btn danger">حذف كل الحسابات</button>
+        </form>
+    </div>
+
+    <?php if ($editing_account && $account_edit): ?>
+        <!-- نموذج تعديل الحساب -->
+        <form method="post" novalidate style="margin-bottom:12px;">
+            <input type="hidden" name="account_id" value="<?= (int)$account_edit['id'] ?>">
+            <input type="text" name="account_name" placeholder="اسم الحساب" value="<?= htmlspecialchars($account_edit['name'], ENT_QUOTES, 'UTF-8') ?>">
+            <input type="text" name="account_balance" placeholder="الرصيد" value="<?= htmlspecialchars($account_edit['balance'], ENT_QUOTES, 'UTF-8') ?>">
+            <input type="submit" name="save_account" value="حفظ التعديل" class="btn">
+            <a href="<?= htmlspecialchars($_SERVER['PHP_SELF']) ?>" class="btn secondary" style="text-decoration:none; display:inline-block; margin-right:8px;">إلغاء</a>
+        </form>
+    <?php else: ?>
+        <!-- نموذج إدخال تحويل جديد -->
+        <form method="post" novalidate>
+            <input type="text" name="source_account" placeholder="الحساب المرسل (ادخل معرف ID أو نص)" value="<?= htmlspecialchars($entered_source, ENT_QUOTES, 'UTF-8') ?>">
+            <input type="text" name="target_account" placeholder="الحساب المستهدف (ادخل معرف ID أو نص)" value="<?= htmlspecialchars($entered_target, ENT_QUOTES, 'UTF-8') ?>">
+            <input type="text" name="amount" placeholder="المبلغ" value="<?= htmlspecialchars($entered_amount, ENT_QUOTES, 'UTF-8') ?>">
+            <input type="submit" name="transfer" value="تحويل الأموال" class="btn">
+            <span class="small">ملاحظة: إذا أدخلت أرقاماً (IDs) فسيتم تحديث الأرصدة لتلك الحسابات. إذا أدخلت نصاً فلن يتغير الرصيد (فقط يُسجّل السجل).</span>
+        </form>
+    <?php endif; ?>
+
+    <h3>قائمة الحسابات</h3>
+    <table>
+        <?php if ($hide_accounts_data): ?>
+            <tr><th>معرّف</th><th>حقل مخفي</th><th>إجراءات</th></tr>
+            <?php foreach ($accounts as $acc): ?>
+                <tr>
+                    <td><?= htmlspecialchars($acc['id'], ENT_QUOTES, 'UTF-8') ?></td>
+                    <td>— (تم إخفاء البيانات)</td>
+                    <td class="account-actions">
+                        <a class="edit" href="?edit_account=<?= (int)$acc['id'] ?>">تعديل</a>
+                        <a class="delete" href="?delete_account=<?= (int)$acc['id'] ?>" onclick="return confirmDeleteAccount();">حذف</a>
+                    </td>
+                </tr>
+            <?php endforeach; ?>
+        <?php else: ?>
+            <tr><th>معرّف</th><th>اسم الحساب</th><th>الرصيد</th><th>إجراءات</th></tr>
+            <?php foreach ($accounts as $acc): ?>
+                <tr>
+                    <td><?= htmlspecialchars($acc['id'], ENT_QUOTES, 'UTF-8') ?></td>
+                    <td><?= htmlspecialchars($acc['name'], ENT_QUOTES, 'UTF-8') ?></td>
+                    <td><?= htmlspecialchars($acc['balance'], ENT_QUOTES, 'UTF-8') ?></td>
+                    <td class="account-actions">
+                        <a class="edit" href="?edit_account=<?= (int)$acc['id'] ?>">تعديل</a>
+                        <a class="delete" href="?delete_account=<?= (int)$acc['id'] ?>" onclick="return confirmDeleteAccount();">حذف</a>
+                    </td>
+                </tr>
+            <?php endforeach; ?>
+        <?php endif; ?>
+    </table>
+
+    <h3>سجل التحويلات</h3>
+    <table>
+        <tr>
+            <th>رقم</th>
+            <th>من (ID / الاسم إذا متوفر)</th>
+            <th>إلى (ID / الاسم إذا متوفر)</th>
+            <th>المبلغ</th>
+            <th>التاريخ</th>
+            <th>إجراءات</th>
+        </tr>
+        <?php foreach ($transactions as $t): ?>
+            <tr>
+                <td><?= htmlspecialchars($t['id'], ENT_QUOTES, 'UTF-8') ?></td>
+                <td>
+                    <?= htmlspecialchars($t['source_account'], ENT_QUOTES, 'UTF-8') ?>
+                    <?php if (!empty($t['source_name'])): ?>
+                        <div class="small">(<?= htmlspecialchars($t['source_name'], ENT_QUOTES, 'UTF-8') ?>)</div>
+                    <?php endif; ?>
+                </td>
+                <td>
+                    <?= htmlspecialchars($t['target_account'], ENT_QUOTES, 'UTF-8') ?>
+                    <?php if (!empty($t['target_name'])): ?>
+                        <div class="small">(<?= htmlspecialchars($t['target_name'], ENT_QUOTES, 'UTF-8') ?>)</div>
+                    <?php endif; ?>
+                </td>
+                <td><?= htmlspecialchars($t['amount'], ENT_QUOTES, 'UTF-8') ?></td>
+                <td><?= htmlspecialchars($t['transaction_date'], ENT_QUOTES, 'UTF-8') ?></td>
+                <td class="actions">
+                    <a class="edit" href="?edit=<?= (int)$t['id'] ?>">تعديل</a>
+                    <a class="delete" href="?delete=<?= (int)$t['id'] ?>" onclick="return confirm('هل أنت متأكد من حذف هذه المعاملة؟ سيتم عكس تأثيرها إن أمكن.');">حذف</a>
+                </td>
+            </tr>
+        <?php endforeach; ?>
+    </table>
+</div>
+</body>
+</html>
